@@ -9,6 +9,7 @@
 #include "llvm/Transforms/Utils/HelloWorld.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include <map>
 #include <vector>
 
@@ -28,8 +29,8 @@ PreservedAnalyses HelloWorldPass::run(Function &F,
   // Signature differences.
   std::map<BasicBlock *, uint16_t> diff;
 
-  // The locations of adjusting signature assignments.
-  std::map<BasicBlock *, Instruction *> branchLoc;
+  // Instructions where we add branches.
+  std::vector<Instruction *> branchLoc;
 
   // A temporary accumulator.
   uint16_t acc = 0;
@@ -41,12 +42,26 @@ PreservedAnalyses HelloWorldPass::run(Function &F,
   Instruction *D = nullptr;
 
   // Initialization IRBuilder
-  IRBuilder<> InitBuilder(&F.getEntryBlock(), F.getEntryBlock().getFirstInsertionPt());
+  IRBuilder<> InitBuilder(&F.getEntryBlock(),
+                          F.getEntryBlock().getFirstInsertionPt());
 
-  G = InitBuilder.CreateAlloca(IntegerType::getInt16Ty(Context));
-  D = InitBuilder.CreateAlloca(IntegerType::getInt16Ty(Context));
+  // Adjusting signature values.
+  std::map<BasicBlock *, uint16_t> Dmap;
+
+  G = InitBuilder.CreateAlloca(IntegerType::getInt16Ty(Context), nullptr, "G");
+  D = InitBuilder.CreateAlloca(IntegerType::getInt16Ty(Context), nullptr, "D");
   InitBuilder.CreateStore(ConstantInt::get(Context, APInt(16, 0)), G);
-  InitBuilder.CreateStore(ConstantInt::get(Context, APInt(16, 0)), D);
+  auto StoreD =
+      InitBuilder.CreateStore(ConstantInt::get(Context, APInt(16, 0)), D);
+
+  auto newBB = BasicBlock::Create(Context, "", &F);
+  IRBuilder<> DivBuilder(newBB, newBB->getFirstInsertionPt());
+
+  // Trigger the divide-by-zero exception.
+  DivBuilder.CreateUDiv(
+      DivBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G),
+      ConstantInt::get(Context, APInt(16, 0)));
+  DivBuilder.CreateBr(newBB);
 
   for (BasicBlock &BB : F) {
     // Naïve approach to assign signatures.
@@ -54,56 +69,56 @@ PreservedAnalyses HelloWorldPass::run(Function &F,
   }
 
   for (BasicBlock &BB : F) {
-    IRBuilder<> InBlockBuilder(&BB, BB.getFirstInsertionPt());
-    BasicBlock *BasePred;
     if (BB.hasNPredecessors(1)) {
       diff[&BB] = sig[BB.getSinglePredecessor()] ^ sig[&BB];
     } else if (BB.hasNPredecessorsOrMore(2)) {
+      BasicBlock *BasePred = nullptr;
       for (BasicBlock *Pred : predecessors(&BB)) {
         BasePred = Pred;
-
         break;
       }
 
       diff[&BB] = sig[BasePred] ^ sig[&BB];
 
       for (BasicBlock *Pred : predecessors(&BB)) {
-
         // D[i, m] = s[i, 1] XOR s[i, m]
-        StoreInst(
-            ConstantInt::get(Context, APInt(16, sig[Pred] ^ sig[BasePred])),
-            D, Pred->getFirstNonPHI());
-
-        // Pred->getInstList().push_front(D);
-        // branchLoc[*Pred] = D;
+        Dmap[Pred] = sig[Pred] ^ sig[BasePred];
       }
     } else {
       diff[&BB] = 0;
     }
+  }
 
-    // G1 = load G
-    auto G1 = InBlockBuilder.CreateLoad(G);
+  for (BasicBlock &BB : F) {
+    IRBuilder<> InBlockBuilder(&BB, &BB == &F.getEntryBlock()
+                                        ? InitBuilder.GetInsertPoint()
+                                        : BB.getFirstInsertionPt());
+
+    auto G1 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
     auto G2 = InBlockBuilder.CreateXor(G1, diff[&BB]);
-    auto sg = InBlockBuilder.CreateStore(G2, G);
-
-    errs() << F.getName() << " left\n";
+    InBlockBuilder.CreateStore(G2, G);
 
     if (BB.hasNPredecessorsOrMore(2)) {
-      auto D1 = InBlockBuilder.CreateLoad(D);
-      auto G3 = InBlockBuilder.CreateLoad(G);
+      auto D1 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), D);
+      auto G3 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
       auto G4 = InBlockBuilder.CreateXor(G3, D1);
       InBlockBuilder.CreateStore(G4, G);
     }
-    errs() << F.getName() << " middle\n";
 
-    // TODO: G5 = load G; br (G5 neq s[j]) error
+    auto G5 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
+    ICmpInst *neq = static_cast<ICmpInst *>(InBlockBuilder.CreateICmpNE(
+        G5, ConstantInt::get(Context, APInt(16, sig[&BB]))));
+    if (Dmap.find(&BB) != Dmap.end())
+      InBlockBuilder.CreateStore(
+          ConstantInt::get(Context, APInt(16, Dmap[&BB])), D);
 
-    BB.getInstList().push_front(G);
-
-    errs() << F.getName() << " right\n";
+    branchLoc.push_back(neq);
   }
 
-  errs() << F.getName() << " completed\n";
+  for (auto neq : branchLoc)
+    SplitBlockAndInsertIfThen(neq, neq->getNextNode(), false, nullptr,
+                              static_cast<DomTreeUpdater *>(nullptr), nullptr,
+                              newBB);
 
-  return PreservedAnalyses::all();
+  return PreservedAnalyses::none();
 }
