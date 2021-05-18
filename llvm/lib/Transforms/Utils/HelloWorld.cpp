@@ -17,11 +17,10 @@ using namespace llvm;
 
 /// Add control-flow checking instructions as described in "Control-Flow
 /// Checking by Software Signatures."
-PreservedAnalyses HelloWorldPass::run(Function &F,
-                                      FunctionAnalysisManager &AM) {
-  errs() << F.getName() << "\n";
+PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
+  errs() << M.getName() << "\n";
 
-  LLVMContext &Context = F.getType()->getContext();
+  LLVMContext &Context = M.getContext();
 
   // The signatures of basic blocks.
   std::map<BasicBlock *, uint16_t> sig;
@@ -29,96 +28,146 @@ PreservedAnalyses HelloWorldPass::run(Function &F,
   // Signature differences.
   std::map<BasicBlock *, uint16_t> diff;
 
+  // Error-handling blocks.
+  std::map<Function *, BasicBlock *> ErrBlks;
+
   // Instructions where we add branches.
   std::vector<Instruction *> branchLoc;
+
+  // Procedure call-related predecessors.
+  std::multimap<BasicBlock *, BasicBlock *> PredSet;
+
+  // Call sites
+  std::vector<CallBase *> CallSites;
 
   // A temporary accumulator.
   uint16_t acc = 0;
 
   // The run-time signature
-  Instruction *G = nullptr;
+  GlobalVariable *G =
+      new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
+                         GlobalValue::LinkageTypes::InternalLinkage,
+                         ConstantInt::get(Context, APInt(16, 0)), "G");
+  // Instruction *G = nullptr;
 
   // The run-time adjusting signature
-  Instruction *D = nullptr;
-
-  // Initialization IRBuilder
-  IRBuilder<> InitBuilder(&F.getEntryBlock(),
-                          F.getEntryBlock().getFirstInsertionPt());
+  // Instruction *D = nullptr;
+  GlobalVariable *D =
+      new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
+                         GlobalValue::LinkageTypes::InternalLinkage,
+                         ConstantInt::get(Context, APInt(16, 0)), "D");
 
   // Adjusting signature values.
   std::map<BasicBlock *, uint16_t> Dmap;
 
-  G = InitBuilder.CreateAlloca(IntegerType::getInt16Ty(Context), nullptr, "G");
-  D = InitBuilder.CreateAlloca(IntegerType::getInt16Ty(Context), nullptr, "D");
-  InitBuilder.CreateStore(ConstantInt::get(Context, APInt(16, 0)), G);
-  auto StoreD =
-      InitBuilder.CreateStore(ConstantInt::get(Context, APInt(16, 0)), D);
+  for (Function &F : M)
+    for (BasicBlock &BB : F)
+      for (Instruction &I : BB) {
+        auto CB = dyn_cast<CallBase>(&I);
+        if (CB != nullptr && !CB->getCalledFunction()->isDeclaration()) {
+          PredSet.insert(
+              std::make_pair(&CB->getCalledFunction()->getEntryBlock(), &BB));
 
-  auto newBB = BasicBlock::Create(Context, "", &F);
-  IRBuilder<> DivBuilder(newBB, newBB->getFirstInsertionPt());
-
-  // Trigger the divide-by-zero exception.
-  DivBuilder.CreateUDiv(
-      DivBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G),
-      ConstantInt::get(Context, APInt(16, 0)));
-  DivBuilder.CreateBr(newBB);
-
-  for (BasicBlock &BB : F) {
-    // Naïve approach to assign signatures.
-    sig[&BB] = acc++;
-  }
-
-  for (BasicBlock &BB : F) {
-    if (BB.hasNPredecessors(1)) {
-      diff[&BB] = sig[BB.getSinglePredecessor()] ^ sig[&BB];
-    } else if (BB.hasNPredecessorsOrMore(2)) {
-      BasicBlock *BasePred = nullptr;
-      for (BasicBlock *Pred : predecessors(&BB)) {
-        BasePred = Pred;
-        break;
+          // Splitting the basic block now can affect the iteration, so we
+          // choose to move the splitting part outside.
+          CallSites.push_back(CB);
+        }
       }
 
-      diff[&BB] = sig[BasePred] ^ sig[&BB];
+  for (auto CallSite : CallSites) {
+    auto NewBlk = SplitBlock(CallSite->getParent(), CallSite->getNextNode());
 
-      for (BasicBlock *Pred : predecessors(&BB)) {
-        // D[i, m] = s[i, 1] XOR s[i, m]
-        Dmap[Pred] = sig[Pred] ^ sig[BasePred];
-      }
-    } else {
-      diff[&BB] = 0;
-    }
+    for (BasicBlock &B : *CallSite->getCalledFunction())
+      for (Instruction &I : B)
+        if (isa<ReturnInst>(&I))
+          PredSet.insert(std::make_pair(NewBlk, &B));
   }
 
-  for (BasicBlock &BB : F) {
-    IRBuilder<> InBlockBuilder(&BB, &BB == &F.getEntryBlock()
-                                        ? InitBuilder.GetInsertPoint()
-                                        : BB.getFirstInsertionPt());
-
-    auto G1 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
-    auto G2 = InBlockBuilder.CreateXor(G1, diff[&BB]);
-    InBlockBuilder.CreateStore(G2, G);
-
-    if (BB.hasNPredecessorsOrMore(2)) {
-      auto D1 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), D);
-      auto G3 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
-      auto G4 = InBlockBuilder.CreateXor(G3, D1);
-      InBlockBuilder.CreateStore(G4, G);
+  for (Function &F : M)
+    for (BasicBlock &BB : F) {
+      // Naïve approach to assign signatures.
+      sig[&BB] = acc++;
     }
 
-    auto G5 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
-    ICmpInst *neq = static_cast<ICmpInst *>(InBlockBuilder.CreateICmpNE(
-        G5, ConstantInt::get(Context, APInt(16, sig[&BB]))));
-    if (Dmap.find(&BB) != Dmap.end())
-      InBlockBuilder.CreateStore(
-          ConstantInt::get(Context, APInt(16, Dmap[&BB])), D);
+  for (Function &F : M)
+    for (BasicBlock &BB : F) {
+      size_t PredSetLen = PredSet.count(&BB);
+      auto PredSetRange = PredSet.equal_range(&BB);
 
-    branchLoc.push_back(neq);
+      if (PredSetLen == 1) {
+        diff[&BB] = sig[PredSetRange.first->second] ^ sig[&BB];
+      } else if (BB.hasNPredecessors(1)) {
+        diff[&BB] = sig[BB.getSinglePredecessor()] ^ sig[&BB];
+      } else if (PredSetLen >= 2) {
+        BasicBlock *BasePred = PredSetRange.first->second;
+
+        diff[&BB] = sig[BasePred] ^ sig[&BB];
+
+        for (auto i = PredSetRange.first; i != PredSetRange.second; ++i) {
+          // D[i, m] = s[i, 1] XOR s[i, m]
+          Dmap[i->second] = sig[i->second] ^ sig[BasePred];
+        }
+      } else if (BB.hasNPredecessorsOrMore(2)) {
+        BasicBlock *BasePred = nullptr;
+        for (BasicBlock *Pred : predecessors(&BB)) {
+          BasePred = Pred;
+          break;
+        }
+
+        diff[&BB] = sig[BasePred] ^ sig[&BB];
+
+        for (BasicBlock *Pred : predecessors(&BB)) {
+          // D[i, m] = s[i, 1] XOR s[i, m]
+          Dmap[Pred] = sig[Pred] ^ sig[BasePred];
+        }
+      } else {
+        diff[&BB] = 0;
+      }
+    }
+
+  for (Function &F : M)
+    for (BasicBlock &BB : F) {
+      IRBuilder<> InBlockBuilder(&BB, BB.getFirstInsertionPt());
+
+      auto G1 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
+      auto G2 = InBlockBuilder.CreateXor(G1, diff[&BB]);
+      InBlockBuilder.CreateStore(G2, G);
+
+      if (BB.hasNPredecessorsOrMore(2)) {
+        auto D1 =
+            InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), D);
+        auto G3 =
+            InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
+        auto G4 = InBlockBuilder.CreateXor(G3, D1);
+        InBlockBuilder.CreateStore(G4, G);
+      }
+
+      auto G5 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
+      ICmpInst *neq = static_cast<ICmpInst *>(InBlockBuilder.CreateICmpNE(
+          G5, ConstantInt::get(Context, APInt(16, sig[&BB]))));
+      if (Dmap.find(&BB) != Dmap.end())
+        InBlockBuilder.CreateStore(
+            ConstantInt::get(Context, APInt(16, Dmap[&BB])), D);
+
+      branchLoc.push_back(neq);
+    }
+
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    auto newBB = BasicBlock::Create(Context, "", &F);
+    IRBuilder<> ErrHdlBuilder(newBB, newBB->getFirstInsertionPt());
+
+    // Simply branch to itself.
+    ErrHdlBuilder.CreateBr(newBB);
+
+    ErrBlks.insert(std::make_pair(&F, newBB));
   }
 
   for (auto neq : branchLoc)
     SplitBlockAndInsertIfThen(neq, neq->getNextNode(), false, nullptr,
                               static_cast<DomTreeUpdater *>(nullptr), nullptr,
-                              newBB);
+                              ErrBlks[neq->getFunction()]);
 
   return PreservedAnalyses::none();
 }
