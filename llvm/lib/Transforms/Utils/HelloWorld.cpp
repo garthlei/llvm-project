@@ -10,10 +10,33 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include <map>
 #include <vector>
 
 using namespace llvm;
+
+// Function *clone(Function &F, std::vector<CallBase *> &CallSites,
+//                 std::map<Instruction *, size_t> &DupNum) {
+//   Function *NewF =
+//       Function::Create(F.getFunctionType(), F.getLinkage(), "", F.getParent());
+//   NewF->copyAttributesFrom(&F);
+
+//   for (BasicBlock &BB : F) {
+//     BasicBlock *NewBB = BasicBlock::Create(BB.getContext(), BB.getName(), NewF);
+//     for (Instruction &I : BB) {
+//       Instruction *NewI = I.clone();
+//       auto CB = dyn_cast<CallBase>(NewI);
+//       if (CB != nullptr && !CB->getCalledFunction()->isDeclaration()) {
+//         CallSites.push_back(CB);
+//         DupNum[CB] = DupNum[dyn_cast<CallBase>(&I)];
+//       }
+//       NewBB->getInstList().push_back(NewI);
+//     }
+//   }
+
+//   return NewF;
+// }
 
 /// Add control-flow checking instructions as described in "Control-Flow
 /// Checking by Software Signatures."
@@ -40,6 +63,17 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
   // Call sites
   std::vector<CallBase *> CallSites;
 
+  // The number of clones of a function
+  std::map<Function *, size_t> NumClones;
+
+  // The duplicate function number for a call site.
+  std::map<Instruction *, size_t> DupNum;
+
+  // The clones of a function
+  std::map<std::pair<Function *, size_t>, Function *> Clones;
+
+  ValueToValueMapTy VMap;
+
   // A temporary accumulator.
   uint16_t acc = 0;
 
@@ -65,17 +99,36 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
       for (Instruction &I : BB) {
         auto CB = dyn_cast<CallBase>(&I);
         if (CB != nullptr && !CB->getCalledFunction()->isDeclaration()) {
-          PredSet.insert(
-              std::make_pair(&CB->getCalledFunction()->getEntryBlock(), &BB));
 
           // Splitting the basic block now can affect the iteration, so we
           // choose to move the splitting part outside.
           CallSites.push_back(CB);
+
+          if (NumClones.find(CB->getCalledFunction()) == NumClones.end()) {
+            NumClones[CB->getCalledFunction()] = 1;
+          } else {
+            ++NumClones[CB->getCalledFunction()];
+          }
+
+          DupNum[CB] = NumClones[CB->getCalledFunction()] - 1;
         }
       }
 
+  for (Function &F : M) {
+    for (size_t i = 0; i < NumClones[&F]; ++i) {
+      Function *NewF = CloneFunction(&F, VMap);
+      Clones[std::make_pair(&F, i)] = NewF;
+    }
+  }
+
   for (auto CallSite : CallSites) {
+    CallSite->setCalledFunction(Clones[std::make_pair(
+        CallSite->getCalledFunction(), DupNum[CallSite])]);
     auto NewBlk = SplitBlock(CallSite->getParent(), CallSite->getNextNode());
+
+    PredSet.insert(
+        std::make_pair(&CallSite->getCalledFunction()->getEntryBlock(),
+                       CallSite->getParent()));
 
     for (BasicBlock &B : *CallSite->getCalledFunction())
       for (Instruction &I : B)
