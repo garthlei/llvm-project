@@ -9,13 +9,35 @@
 #include "llvm/Transforms/Utils/HelloWorld.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/IR/InlineAsm.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Cloning.h"
 #include <map>
 #include <vector>
 
 using namespace llvm;
+
+// Function *clone(Function &F, std::vector<CallBase *> &CallSites,
+//                 std::map<Instruction *, size_t> &DupNum) {
+//   Function *NewF =
+//       Function::Create(F.getFunctionType(), F.getLinkage(), "",
+//       F.getParent());
+//   NewF->copyAttributesFrom(&F);
+
+//   for (BasicBlock &BB : F) {
+//     BasicBlock *NewBB = BasicBlock::Create(BB.getContext(), BB.getName(),
+//     NewF); for (Instruction &I : BB) {
+//       Instruction *NewI = I.clone();
+//       auto CB = dyn_cast<CallBase>(NewI);
+//       if (CB != nullptr && !CB->getCalledFunction()->isDeclaration()) {
+//         CallSites.push_back(CB);
+//         DupNum[CB] = DupNum[dyn_cast<CallBase>(&I)];
+//       }
+//       NewBB->getInstList().push_back(NewI);
+//     }
+//   }
+
+//   return NewF;
+// }
 
 /// Add control-flow checking instructions as described in "Control-Flow
 /// Checking by Software Signatures."
@@ -29,6 +51,9 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
 
   // Signature differences.
   std::map<BasicBlock *, uint16_t> diff;
+
+  // Error-handling blocks.
+  std::map<Function *, BasicBlock *> ErrBlks;
 
   // Instructions where we add branches.
   std::vector<Instruction *> branchLoc;
@@ -53,17 +78,17 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
   // A temporary accumulator.
   uint16_t acc = 0;
 
-  // // The run-time signature
-  // GlobalVariable *G =
-  //     new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
-  //                        GlobalValue::LinkageTypes::InternalLinkage,
-  //                        ConstantInt::get(Context, APInt(16, 0)), "G");
+  // The run-time signature
+  GlobalVariable *G =
+      new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
+                         GlobalValue::LinkageTypes::InternalLinkage,
+                         ConstantInt::get(Context, APInt(16, 0)), "G");
 
-  // // The run-time adjusting signature
-  // GlobalVariable *D =
-  //     new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
-  //                        GlobalValue::LinkageTypes::InternalLinkage,
-  //                        ConstantInt::get(Context, APInt(16, 0)), "D");
+  // The run-time adjusting signature
+  GlobalVariable *D =
+      new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
+                         GlobalValue::LinkageTypes::InternalLinkage,
+                         ConstantInt::get(Context, APInt(16, 0)), "D");
 
   // Adjusting signature values.
   std::map<BasicBlock *, uint16_t> Dmap;
@@ -91,6 +116,16 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
   for (Function &F : M) {
     for (size_t i = 0; i < NumClones[&F]; ++i) {
       Function *NewF = CloneFunction(&F, VMap);
+      for (auto it1 = NewF->begin(), it2 = F.begin(), end = NewF->end();
+           it1 != end; ++it1, ++it2)
+        for (auto iti1 = it1->begin(), iti2 = it2->begin(), iend = it1->end();
+             iti1 != iend; ++iti1, ++iti2) {
+          CallBase *CB = dyn_cast<CallBase>(iti1);
+          if (CB != nullptr && !CB->getCalledFunction()->isDeclaration()) {
+            CallSites.push_back(CB);
+            DupNum[CB] = DupNum[dyn_cast<CallBase>(iti2)];
+          }
+        }
       Clones[std::make_pair(&F, i)] = NewF;
     }
   }
@@ -98,27 +133,28 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
   for (auto CallSite : CallSites) {
     CallSite->setCalledFunction(Clones[std::make_pair(
         CallSite->getCalledFunction(), DupNum[CallSite])]);
-    auto NewBlk = SplitBlock(CallSite->getParent(), CallSite->getNextNode());
+    SplitBlock(CallSite->getParent(), CallSite->getNextNode());
 
     PredSet.insert(
         std::make_pair(&CallSite->getCalledFunction()->getEntryBlock(),
                        CallSite->getParent()));
+  }
 
+  // We have to use a new for-loop to find the predecessors of blocks after
+  // calls, because basic blocks containing the return statement might have
+  // been splitted.
+  for (auto CallSite : CallSites)
     for (BasicBlock &B : *CallSite->getCalledFunction())
       for (Instruction &I : B)
         if (isa<ReturnInst>(&I))
-          PredSet.insert(std::make_pair(NewBlk, &B));
-  }
+          PredSet.insert(
+              std::make_pair(CallSite->getParent()->getNextNode(), &B));
 
-  for (Function &F : M) {
-    errs() << "In fuction " << F.getName() << "\n";
+  for (Function &F : M)
     for (BasicBlock &BB : F) {
       // Naïve approach to assign signatures.
       sig[&BB] = acc++;
-      errs() << "  Basic block " << BB.getName() << " has signature "
-             << sig[&BB] << "\n";
     }
-  }
 
   for (Function &F : M)
     for (BasicBlock &BB : F) {
@@ -160,64 +196,45 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
     for (BasicBlock &BB : F) {
       IRBuilder<> InBlockBuilder(&BB, BB.getFirstInsertionPt());
 
-      // auto G1 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context),
-      // G); auto G2 = InBlockBuilder.CreateXor(G1, diff[&BB]);
+      auto G1 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
+      auto G2 = InBlockBuilder.CreateXor(G1, diff[&BB]);
+      InBlockBuilder.CreateStore(G2, G);
 
-      InBlockBuilder.CreateCall(
-          InlineAsm::get(FunctionType::get(Type::getVoidTy(Context),
-                                           {Type::getInt16Ty(Context)}, false),
-                         "#__GENERATED__.insn r CUSTOM_0, 2, 0, x0, $0, x0\n\t",
-                         "r", true),
-          {ConstantInt::get(Context, APInt(16, diff[&BB]))});
-      // InBlockBuilder.CreateStore(G2, G);
-
-      if (BB.hasNPredecessorsOrMore(2)) {
-        InBlockBuilder.CreateCall(InlineAsm::get(
-            FunctionType::get(Type::getVoidTy(Context), false),
-            "#__GENERATED__.insn r CUSTOM_0, 0, 0, x0, x0, x0\n\t", "", true));
+      if (BB.hasNPredecessorsOrMore(2) || PredSet.count(&BB) >= 2) {
+        auto D1 =
+            InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), D);
+        auto G3 =
+            InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
+        auto G4 = InBlockBuilder.CreateXor(G3, D1);
+        InBlockBuilder.CreateStore(G4, G);
       }
 
-      // auto G5 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context),
-      // G); ICmpInst *neq = static_cast<ICmpInst
-      // *>(InBlockBuilder.CreateICmpNE(
-      //     G5, ConstantInt::get(Context, APInt(16, sig[&BB]))));
-      InBlockBuilder.CreateCall(
-          InlineAsm::get(FunctionType::get(Type::getVoidTy(Context),
-                                           {Type::getInt16Ty(Context)}, false),
-                         "#__GENERATED__.insn r CUSTOM_2, 2, 0, x0, $0, x0\n\t",
-                         "r", true),
-          {ConstantInt::get(Context, APInt(16, sig[&BB]))});
-
+      auto G5 = InBlockBuilder.CreateLoad(IntegerType::getInt16Ty(Context), G);
+      ICmpInst *neq = static_cast<ICmpInst *>(InBlockBuilder.CreateICmpNE(
+          G5, ConstantInt::get(Context, APInt(16, sig[&BB]))));
       if (Dmap.find(&BB) != Dmap.end())
-        InBlockBuilder.CreateCall(
-            InlineAsm::get(
-                FunctionType::get(Type::getVoidTy(Context),
-                                  {Type::getInt16Ty(Context)}, false),
-                "#__GENERATED__.insn r CUSTOM_1, 2, 0, x0, $0, x0\n\t", "r",
-                true),
-            {ConstantInt::get(Context, APInt(16, Dmap[&BB]))});
-      // InBlockBuilder.CreateStore(
-      //     ConstantInt::get(Context, APInt(16, Dmap[&BB])), D);
+        InBlockBuilder.CreateStore(
+            ConstantInt::get(Context, APInt(16, Dmap[&BB])), D);
 
-      // branchLoc.push_back(neq);
+      branchLoc.push_back(neq);
     }
 
-  // for (Function &F : M) {
-  //   if (F.isDeclaration())
-  //     continue;
-  //   auto newBB = BasicBlock::Create(Context, "", &F);
-  //   IRBuilder<> ErrHdlBuilder(newBB, newBB->getFirstInsertionPt());
+  for (Function &F : M) {
+    if (F.isDeclaration())
+      continue;
+    auto newBB = BasicBlock::Create(Context, "", &F);
+    IRBuilder<> ErrHdlBuilder(newBB, newBB->getFirstInsertionPt());
 
-  //   // Simply branch to itself.
-  //   ErrHdlBuilder.CreateBr(newBB);
+    // Simply branch to itself.
+    ErrHdlBuilder.CreateBr(newBB);
 
-  //   ErrBlks.insert(std::make_pair(&F, newBB));
-  // }
+    ErrBlks.insert(std::make_pair(&F, newBB));
+  }
 
-  // for (auto neq : branchLoc)
-  //   SplitBlockAndInsertIfThen(neq, neq->getNextNode(), false, nullptr,
-  //                             static_cast<DomTreeUpdater *>(nullptr),
-  //                             nullptr, ErrBlks[neq->getFunction()]);
+  for (auto neq : branchLoc)
+    SplitBlockAndInsertIfThen(neq, neq->getNextNode(), false, nullptr,
+                              static_cast<DomTreeUpdater *>(nullptr), nullptr,
+                              ErrBlks[neq->getFunction()]);
 
   return PreservedAnalyses::none();
 }
