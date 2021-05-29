@@ -16,28 +16,6 @@
 
 using namespace llvm;
 
-// Function *clone(Function &F, std::vector<CallBase *> &CallSites,
-//                 std::map<Instruction *, size_t> &DupNum) {
-//   Function *NewF =
-//       Function::Create(F.getFunctionType(), F.getLinkage(), "", F.getParent());
-//   NewF->copyAttributesFrom(&F);
-
-//   for (BasicBlock &BB : F) {
-//     BasicBlock *NewBB = BasicBlock::Create(BB.getContext(), BB.getName(), NewF);
-//     for (Instruction &I : BB) {
-//       Instruction *NewI = I.clone();
-//       auto CB = dyn_cast<CallBase>(NewI);
-//       if (CB != nullptr && !CB->getCalledFunction()->isDeclaration()) {
-//         CallSites.push_back(CB);
-//         DupNum[CB] = DupNum[dyn_cast<CallBase>(&I)];
-//       }
-//       NewBB->getInstList().push_back(NewI);
-//     }
-//   }
-
-//   return NewF;
-// }
-
 /// Add control-flow checking instructions as described in "Control-Flow
 /// Checking by Software Signatures."
 PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
@@ -82,10 +60,8 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
       new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
                          GlobalValue::LinkageTypes::InternalLinkage,
                          ConstantInt::get(Context, APInt(16, 0)), "G");
-  // Instruction *G = nullptr;
 
   // The run-time adjusting signature
-  // Instruction *D = nullptr;
   GlobalVariable *D =
       new GlobalVariable(M, IntegerType::getInt16Ty(Context), false,
                          GlobalValue::LinkageTypes::InternalLinkage,
