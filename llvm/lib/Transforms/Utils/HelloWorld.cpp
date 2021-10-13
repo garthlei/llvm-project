@@ -48,8 +48,6 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
   // The clones of a function
   std::map<std::pair<Function *, size_t>, Function *> Clones;
 
-  ValueToValueMapTy VMap;
-
   // A temporary accumulator.
   uint16_t acc = 0;
 
@@ -89,7 +87,9 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
       }
 
   for (Function &F : M) {
-    for (size_t i = 0; i < NumClones[&F]; ++i) {
+    Clones[std::make_pair(&F, 0)] = &F;
+    for (size_t i = 1; i < NumClones[&F]; ++i) {
+      ValueToValueMapTy VMap;
       Function *NewF = CloneFunction(&F, VMap);
       for (auto it1 = NewF->begin(), it2 = F.begin(), end = NewF->end();
            it1 != end; ++it1, ++it2)
@@ -164,7 +164,7 @@ PreservedAnalyses HelloWorldPass::run(Module &M, ModuleAnalysisManager &AM) {
           Dmap[Pred] = sig[Pred] ^ sig[BasePred];
         }
       } else {
-        diff[&BB] = 0;
+        diff[&BB] = sig[&BB];
       }
     }
 
